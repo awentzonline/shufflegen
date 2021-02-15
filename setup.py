@@ -19,6 +19,8 @@ setup(
     packages=find_packages(),
     install_requires=[
         'numpy',
+        'pytorch-lightning',
+        'pytorch-lightning-bolts',
         'torch',
         'torchvision',
         'tqdm',
