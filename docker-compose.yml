@@ -1,0 +1,7 @@
+version: '3'
+services:
+  worker:
+    build: .
+    volumes:
+      - ./:/app
+    command: sh -c "cd /app && ./scripts/run_tests.sh && ./scripts/run_linter.sh"

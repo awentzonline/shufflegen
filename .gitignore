@@ -1,0 +1,13 @@
+venv
+__pycache__
+sample/
+checkpoint/
+*.egg-info
+*.onnx
+*.pt
+*.log
+.DS_Store
+*.pyc
+.coverage
+kubeflow/*.zip
+runs/
