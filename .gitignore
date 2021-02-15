@@ -9,5 +9,5 @@ checkpoint/
 .DS_Store
 *.pyc
 .coverage
-kubeflow/*.zip
 runs/
+lightning_logs/

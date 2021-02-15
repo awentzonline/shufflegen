@@ -246,5 +246,5 @@ if __name__ == '__main__':
         args.img_path, args.img_size,
         batch_size=args.batch_size, num_workers=args.num_workers
     )
-    trainer = pl.Trainer(gpus=args.gpus)
+    trainer = pl.Trainer.from_argparse_args(args)
     trainer.fit(model, dm)
