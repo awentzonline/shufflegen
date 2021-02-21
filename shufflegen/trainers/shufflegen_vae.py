@@ -60,7 +60,8 @@ class ShuffleGenVAE(pl.LightningModule):
         pieces = pieces.view(nr * nc * bs, c, h, w)
         p, q, z = self.encode_pieces(pieces)
         recons = self.decode_pieces(z)
-        vae_recon_loss = F.mse_loss(recons, pieces)
+        recons_dist = Normal(recons, 1. / 255.)
+        vae_recon_loss = -recons_dist.log_prob(pieces).mean()
         vae_divergence_loss = kl_divergence(p, q, z, beta=self.args.kl_beta)
         vae_loss = vae_recon_loss + vae_divergence_loss
         # early out for pretraining VAE
