@@ -14,7 +14,7 @@ from torchvision import transforms
 from torchvision.utils import save_image
 
 from shufflegen.datasets.just_images import JustImagesDataModule
-from shufflegen.models.positional import PositionalEncoding
+from shufflegen.models.positional import PositionalEncoding, PositionalEncodingCat
 
 
 class ShuffleGenVAE(pl.LightningModule):
@@ -22,12 +22,18 @@ class ShuffleGenVAE(pl.LightningModule):
         super().__init__()
         self.args = args
         self.vae = VAE(args.piece_size, latent_dim=args.latent_dims)
-        args.xformer_dims = 2 * args.latent_dims
+        base_x_former_dims = 2 * args.latent_dims
+        pe_dims = args.pe_dims if args.pe_dims else base_x_former_dims
+        pe_class = dict(
+            add=PositionalEncoding,
+            cat=PositionalEncodingCat,
+        )[args.pe]
+        self.positional_encoder = pe_class(pe_dims)
+        self.xformer_dims = base_x_former_dims + self.positional_encoder.additional_dims
         self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(args.xformer_dims, args.heads),
+            nn.TransformerEncoderLayer(self.xformer_dims, args.heads),
             args.layers
         )
-        self.positional_encoder = PositionalEncoding(args.xformer_dims)
         self._steps = 0  # for pretraining
 
     def forward(self, pieces):
@@ -37,6 +43,7 @@ class ShuffleGenVAE(pl.LightningModule):
         enc_pieces = normal_dist_to_vector(q)
         enc_pieces = enc_pieces.view(nr * nc, bs, 2 * self.args.latent_dims)
         transformed = self.transformer(self.positional_encoder(enc_pieces))
+        transformed = self.positional_encoder.decode(transformed)
         transformed_dist_params = transformed.view(nr * nc * bs, self.args.latent_dims, 2)
         transformed_dist = vector_to_normal_dist(transformed_dist_params)
         transformed_z = transformed_dist.sample()
@@ -76,6 +83,7 @@ class ShuffleGenVAE(pl.LightningModule):
         shuffled_pieces, perm = self.shuffle_pieces(enc_pieces)
         shuffled_pieces = shuffled_pieces.view(nr * nc, bs, 2 * self.args.latent_dims).detach()
         transformed = self.transformer(self.positional_encoder(shuffled_pieces))
+        transformed = self.positional_encoder.decode(transformed)
         transformed_dist_params = transformed.view(nr * nc * bs, self.args.latent_dims, 2)
         transformed_dist = vector_to_normal_dist(transformed_dist_params)
         transformed_z = transformed_dist.rsample()
@@ -165,7 +173,6 @@ class ShuffleGenVAE(pl.LightningModule):
     def add_argparse_args(self, p):
         p.add_argument('img_path')
         p.add_argument('--latent-dims', default=100, type=int)
-        p.add_argument('--xformer-dims', default=200, type=int)
         p.add_argument('--layers', default=5, type=int)
         p.add_argument('--heads', default=4, type=int)
         p.add_argument('--lr', default=0.001, type=float)
@@ -178,6 +185,8 @@ class ShuffleGenVAE(pl.LightningModule):
         p.add_argument('--tv-loss', default=1., type=float)
         p.add_argument('--pretrain-vae', default=0, type=int)
         p.add_argument('--kl-beta', default=0.1, type=float)
+        p.add_argument('--pe', default='add')
+        p.add_argument('--pe-dims', default=None, type=int)
         return p
 
 
