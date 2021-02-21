@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 from pl_bolts.models.autoencoders import VAE
 import torch
 from torch import nn
-from torch.distributions import Normal
+from torch.distributions import Normal, kl_divergence
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.utils import save_image
@@ -22,31 +22,22 @@ class ShuffleGenVAE(pl.LightningModule):
         super().__init__()
         self.args = args
         self.vae = VAE(args.piece_size, latent_dim=args.latent_dims)
+        args.xformer_dims = 2 * args.latent_dims
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(args.xformer_dims, args.heads),
             args.layers
         )
         self.positional_encoder = PositionalEncoding(args.xformer_dims)
-        self.vae_to_xformer = nn.Sequential(
-            nn.Linear(args.latent_dims, args.xformer_dims),
-        )
-        self.xformer_to_vae = nn.Sequential(
-            nn.Linear(args.xformer_dims, 2 * args.latent_dims),
-        )
         self._steps = 0  # for pretraining
 
     def forward(self, pieces):
         nr, nc, bs, c, h, w = pieces.shape
         pieces = pieces.view(nr * nc * bs, c, h, w)
         p, q, z = self.encode_pieces(pieces)
-        enc_pieces = z
-        enc_pieces = enc_pieces.view(nr * nc * bs, self.args.latent_dims)
-        enc_pieces = self.vae_to_xformer(enc_pieces)
-        enc_pieces = enc_pieces.view(nr * nc, bs, self.args.xformer_dims)
+        enc_pieces = normal_dist_to_vector(q)
+        enc_pieces = enc_pieces.view(nr * nc, bs, 2 * self.args.latent_dims)
         transformed = self.transformer(self.positional_encoder(enc_pieces))
-        transformed = transformed.view(nr * nc * bs, self.args.xformer_dims)
-        transformed_dist_params = self.xformer_to_vae(transformed)
-        transformed_dist_params = transformed_dist_params.view(nr * nc * bs, self.args.latent_dims, 2)
+        transformed_dist_params = transformed.view(nr * nc * bs, self.args.latent_dims, 2)
         transformed_dist = vector_to_normal_dist(transformed_dist_params)
         transformed_z = transformed_dist.sample()
         pieces_dec = self.decode_pieces(transformed_z)
@@ -62,7 +53,7 @@ class ShuffleGenVAE(pl.LightningModule):
         recons = self.decode_pieces(z)
         recons_dist = Normal(recons, 1. / 255.)
         vae_recon_loss = -recons_dist.log_prob(pieces).mean()
-        vae_divergence_loss = kl_divergence(p, q, z, beta=self.args.kl_beta)
+        vae_divergence_loss = kl_divergence(q, p).mean() * self.args.kl_beta
         vae_loss = vae_recon_loss + vae_divergence_loss
         # early out for pretraining VAE
         if self._steps < self.args.pretrain_vae:
@@ -80,16 +71,12 @@ class ShuffleGenVAE(pl.LightningModule):
                 "loss": vae_loss
             })
 
-        enc_pieces = z
-        enc_pieces = enc_pieces.view(nr * nc, bs, self.args.latent_dims)
+        enc_pieces = normal_dist_to_vector(q)
+        enc_pieces = enc_pieces.view(nr * nc, bs, 2 * self.args.latent_dims)
         shuffled_pieces, perm = self.shuffle_pieces(enc_pieces)
-        shuffled_pieces = shuffled_pieces.view(nr * nc * bs, self.args.latent_dims)
-        shuffled_pieces = self.vae_to_xformer(shuffled_pieces.detach())
-        shuffled_pieces = shuffled_pieces.view(nr * nc, bs, self.args.xformer_dims)
+        shuffled_pieces = shuffled_pieces.view(nr * nc, bs, 2 * self.args.latent_dims).detach()
         transformed = self.transformer(self.positional_encoder(shuffled_pieces))
-        transformed = transformed.view(nr * nc * bs, self.args.xformer_dims)
-        transformed_dist_params = self.xformer_to_vae(transformed)
-        transformed_dist_params = transformed_dist_params.view(nr * nc * bs, self.args.latent_dims, 2)
+        transformed_dist_params = transformed.view(nr * nc * bs, self.args.latent_dims, 2)
         transformed_dist = vector_to_normal_dist(transformed_dist_params)
         transformed_z = transformed_dist.rsample()
 
@@ -97,9 +84,9 @@ class ShuffleGenVAE(pl.LightningModule):
         # recon_loss = F.mse_loss(pieces_dec, pieces)
         recon_loss = 0.
         tv_loss = 0.  # total_variation_loss(pieces_dec, self.args.tv_loss)
-        vae_transformed_divergence_loss = kl_divergence(
-            detach_normal_dist(q), transformed_dist, transformed_z, beta=self.args.kl_beta
-        )
+        vae_transformed_divergence_loss = \
+            kl_divergence(p, detach_normal_dist(q)).mean() * self.args.kl_beta
+
         vae_loss = vae_loss + vae_transformed_divergence_loss
 
         if np.random.uniform() < self.args.p_log:
@@ -192,16 +179,6 @@ class ShuffleGenVAE(pl.LightningModule):
         p.add_argument('--pretrain-vae', default=0, type=int)
         p.add_argument('--kl-beta', default=0.1, type=float)
         return p
-
-
-def kl_divergence(p, q, z, beta=0.1):
-    log_qz = q.log_prob(z)
-    log_pz = p.log_prob(z)
-
-    kl = log_qz - log_pz
-    kl = kl.mean()
-    kl *= beta
-    return kl
 
 
 def vector_to_normal_dist(params):
