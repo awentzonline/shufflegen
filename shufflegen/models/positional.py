@@ -64,9 +64,10 @@ class LearnablePositionalEncodingCat(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         self.d_model = d_model
         self.embedding = nn.Embedding(max_len, d_model)
+        self.register_buffer('embedding_ids', torch.arange(max_len))
 
     def forward(self, x):
-        embedding_ids = torch.arange(len(x))[..., None]
+        embedding_ids = self.embedding_ids[:len(x)][..., None]
         embeddings = self.embedding(embedding_ids)
         seq, batch = x.shape[:2]
         embeddings = embeddings.repeat(1, batch, 1)
