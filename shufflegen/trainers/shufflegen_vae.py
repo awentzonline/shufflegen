@@ -14,7 +14,8 @@ from torchvision import transforms
 from torchvision.utils import save_image
 
 from shufflegen.datasets.just_images import JustImagesDataModule
-from shufflegen.models.positional import PositionalEncoding, PositionalEncodingCat
+from shufflegen.models.positional import (
+    LearnablePositionalEncodingCat, PositionalEncoding, PositionalEncodingCat)
 
 
 class ShuffleGenVAE(pl.LightningModule):
@@ -27,6 +28,7 @@ class ShuffleGenVAE(pl.LightningModule):
         pe_class = dict(
             add=PositionalEncoding,
             cat=PositionalEncodingCat,
+            learn=LearnablePositionalEncodingCat,
         )[args.pe]
         self.positional_encoder = pe_class(pe_dims)
         self.xformer_dims = base_x_former_dims + self.positional_encoder.additional_dims
