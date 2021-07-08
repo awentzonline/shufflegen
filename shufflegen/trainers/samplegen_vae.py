@@ -13,42 +13,39 @@ import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.utils import save_image
 
-from shufflegen.datasets.just_images import JustImagesDataModule
+from shufflegen.datasets.sample_images import SampleImagesDataModule
 from shufflegen.models.positional import (
     LearnablePositionalEncodingCat, PositionalEncoding, PositionalEncodingCat)
 
 
-class ShuffleGenVAE(pl.LightningModule):
+class SampleGenVAE(pl.LightningModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
         self.vae = VAE(args.piece_size, latent_dim=args.latent_dims)
-        if args.xformer_dims:
-            base_xformer_dims = args.xformer_dims
-            self.project_xformer = True
-        else:
-            base_xformer_dims = 2 * args.latent_dims
-            self.project_xformer = False
-        pe_dims = args.pe_dims if args.pe_dims else base_xformer_dims
+        self.xformer_feature_dims = args.xformer_dims
+        pe_dims = args.pe_dims if args.pe_dims else self.xformer_feature_dims
         pe_class = dict(
             add=PositionalEncoding,
             cat=PositionalEncodingCat,
             learn=LearnablePositionalEncodingCat,
         )[args.pe]
         self.positional_encoder = pe_class(pe_dims)
-        self.xformer_feature_dims = base_xformer_dims
-        self.xformer_dims = base_xformer_dims + self.positional_encoder.additional_dims
+        self.xformer_dims = self.xformer_feature_dims + self.positional_encoder.additional_dims
         self.transformer = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(self.xformer_dims, args.heads),
             args.layers
         )
-        if self.project_xformer:
-            self.vae_to_xformer = nn.Sequential(
-                nn.Linear(2 * args.latent_dims, self.xformer_feature_dims),
-            )
-            self.xformer_to_vae = nn.Sequential(
-                nn.Linear(self.xformer_feature_dims, 2 * args.latent_dims),
-            )
+        param_dims = 1 + 1 + 1  # top, left, scale
+        self.vae_to_xformer = nn.Sequential(
+            nn.Linear(2 * args.latent_dims, self.xformer_feature_dims),
+        )
+        self.xformer_to_params = nn.Sequential(
+            nn.Linear(self.xformer_feature_dims, param_dims * 2),
+        )
+        self.xformer_to_global = nn.Sequential(
+            nn.Linear(self.xformer_feature_dims, args.latent_dims * 2),
+        )
         self._steps = 0  # for pretraining
 
     def forward(self, pieces):
@@ -57,15 +54,8 @@ class ShuffleGenVAE(pl.LightningModule):
         p, q, z = self.encode_pieces(pieces)
         enc_pieces = normal_dist_to_vector(q)
         enc_pieces = enc_pieces.view(nr * nc, bs, 2 * self.args.latent_dims)
-        if self.project_xformer:
-            enc_pieces = enc_pieces.view(nr * nc * bs, 2 * self.args.latent_dims)
-            enc_pieces = self.vae_to_xformer(enc_pieces)
-            enc_pieces = enc_pieces.view(nr * nc, bs, self.xformer_feature_dims)
         transformed = self.transformer(self.positional_encoder(enc_pieces))
         transformed = self.positional_encoder.decode(transformed)
-        if self.project_xformer:
-            transformed = transformed.view(nr * nc * bs, self.xformer_feature_dims)
-            transformed = self.xformer_to_vae(transformed)
         transformed_dist_params = transformed.view(nr * nc * bs, self.args.latent_dims, 2)
         transformed_dist = vector_to_normal_dist(transformed_dist_params)
         transformed_z = transformed_dist.sample()
@@ -73,11 +63,9 @@ class ShuffleGenVAE(pl.LightningModule):
         return pieces_dec
 
     def training_step(self, batch, batch_idx):
-        images = batch
-        pieces = self.make_pieces(images)
-
-        nr, nc, bs, c, h, w = pieces.shape
-        pieces = pieces.view(nr * nc * bs, c, h, w)
+        global_imgs, pieces, tops, lefts, scales = batch
+        bs, ns, c, h, w = pieces.shape
+        pieces = pieces.view(ns * bs, c, h, w)
         p, q, z = self.encode_pieces(pieces)
         recons = self.decode_pieces(z)
         recons_dist = Normal(recons, 1. / 255.)
@@ -101,58 +89,55 @@ class ShuffleGenVAE(pl.LightningModule):
             })
 
         enc_pieces = normal_dist_to_vector(q)
-        enc_pieces = enc_pieces.view(nr * nc, bs, 2 * self.args.latent_dims)
-        shuffled_pieces, perm = self.shuffle_pieces(enc_pieces)
-        shuffled_pieces = shuffled_pieces.view(nr * nc, bs, 2 * self.args.latent_dims).detach()
-        if self.project_xformer:
-            shuffled_pieces = shuffled_pieces.view(nr * nc * bs, 2 * self.args.latent_dims)
-            shuffled_pieces = self.vae_to_xformer(shuffled_pieces)
-            shuffled_pieces = shuffled_pieces.view(nr * nc, bs, self.xformer_feature_dims)
-        transformed = self.transformer(self.positional_encoder(shuffled_pieces))
+        enc_pieces = enc_pieces.view(bs, ns, 2 * self.args.latent_dims).detach()
+        enc_pieces = enc_pieces.permute(1, 0, 2)
+        enc_pieces = enc_pieces.reshape(ns * bs, 2 * self.args.latent_dims)
+        enc_pieces = self.vae_to_xformer(enc_pieces)
+        enc_pieces = enc_pieces.reshape(ns, bs, self.xformer_feature_dims)
+        transformed = self.transformer(self.positional_encoder(enc_pieces))
         transformed = self.positional_encoder.decode(transformed)
-        if self.project_xformer:
-            transformed = transformed.view(nr * nc * bs, self.xformer_feature_dims)
-            transformed = self.xformer_to_vae(transformed)
-            #enc_pieces = enc_pieces.view(nr * nc, bs, 2 * self.args.latent_dims)
-        transformed_dist_params = transformed.view(nr * nc * bs, self.args.latent_dims, 2)
-        transformed_dist = vector_to_normal_dist(transformed_dist_params)
-        transformed_z = transformed_dist.rsample()
+        transformed = transformed.permute(1, 0, 2)
+        transformed = transformed.view(bs, ns, self.xformer_feature_dims)
+        # recon global img loss
+        _, global_img_z, _ = self.encode_pieces(global_imgs)
+        global_img_z = normal_dist_to_vector(global_img_z)
+        global_img_z = global_img_z.detach().repeat(ns, 1, 1)
+        global_img_dist = vector_to_normal_dist(global_img_z)
+        # predict global from transformer features
+        p_global_img_z = self.xformer_to_global(transformed)
+        p_global_img_z = p_global_img_z.view(bs * ns, self.args.latent_dims, 2)
+        p_global_img_dist = vector_to_normal_dist(p_global_img_z)
+        global_recon_loss = kl_divergence(p_global_img_dist, global_img_dist).mean()
 
-        # pieces_dec = self.decode_pieces(transformed_z)
-        # recon_loss = F.mse_loss(pieces_dec, pieces)
-        recon_loss = 0.
-        tv_loss = 0.  # total_variation_loss(pieces_dec, self.args.tv_loss)
-        vae_transformed_divergence_loss = \
-            kl_divergence(p, detach_normal_dist(q)).mean() * self.args.kl_beta
+        # parameter loss
+        p_parameter_z = self.xformer_to_params(transformed)
+        
 
-        vae_loss = vae_loss + vae_transformed_divergence_loss
-
-        if np.random.uniform() < self.args.p_log:
-            with torch.no_grad():
-                vae_recons = self.reconstruct_pieces(recons)
-                save_image(vae_recons, 'recons_vae.png')
-                if 'pieces_dec' not in locals():  # hacking around with mse_loss
-                    pieces_dec = self.decode_pieces(transformed_z)
-                recons = self.reconstruct_pieces(pieces_dec)
-                save_image(recons, 'recons_xform.png')
-                recon_input = self.reconstruct_pieces(pieces)
-                save_image(recon_input, 'recon_input.png')
-                re_piece = pieces.view(nr, nc, bs, c, h, w)
-                re_piece = self(re_piece)
-                re_piece = self.reconstruct_pieces(re_piece)
-                save_image(re_piece, 'recon_input_xform.png')
+        # if np.random.uniform() < self.args.p_log:
+        #     with torch.no_grad():
+        #         vae_recons = self.reconstruct_pieces(recons)
+        #         save_image(vae_recons, 'recons_vae.png')
+        #         if 'pieces_dec' not in locals():  # hacking around with mse_loss
+        #             pieces_dec = self.decode_pieces(transformed_z)
+        #         recons = self.reconstruct_pieces(pieces_dec)
+        #         save_image(recons, 'recons_xform.png')
+        #         recon_input = self.reconstruct_pieces(pieces)
+        #         save_image(recon_input, 'recon_input.png')
+        #         re_piece = pieces.view(nr, nc, bs, c, h, w)
+        #         re_piece = self(re_piece)
+        #         re_piece = self.reconstruct_pieces(re_piece)
+        #         save_image(re_piece, 'recon_input_xform.png')
 
         self._steps += 1
 
         self.log_dict(dict(
-            recon_loss=recon_loss,
             vae_loss=vae_loss,
             vae_recon_loss=vae_recon_loss,
             vae_divergence_loss=vae_divergence_loss,
-            vae_transformed_divergence_loss=vae_transformed_divergence_loss,
+            global_recon_loss=global_recon_loss,
         ))
         return OrderedDict({
-            "loss": recon_loss + vae_loss
+            "loss": vae_loss + global_recon_loss
         })
 
     def configure_optimizers(self):
@@ -171,23 +156,6 @@ class ShuffleGenVAE(pl.LightningModule):
         #z = dist.rsample()
         pieces_dec = self.vae.decoder(z)
         return pieces_dec
-
-    def make_pieces(self, imgs):
-        batch_size = imgs.shape[0]
-        ns = self.args.img_size // self.args.piece_size
-        ps = self.args.piece_size
-        pieces = F.unfold(imgs, ps, stride=ps)
-        pieces = pieces.permute(-1, 0, 1).view(ns, ns, batch_size, self.args.img_channels, ps, ps).contiguous()
-        return pieces
-
-    def shuffle_pieces(self, pieces):
-        # give each image its own shuffling
-        # pieces = torch.stack([
-        #     batch[torch.randperm(len(batch))] for  in pieces
-        # ])
-        perm = torch.randperm(len(pieces))
-        pieces = pieces[perm]
-        return pieces, perm
 
     def reconstruct_pieces(self, pieces):
         batch_size = self.args.batch_size
@@ -255,13 +223,13 @@ if __name__ == '__main__':
     import argparse
 
     p = argparse.ArgumentParser()
-    p = ShuffleGenVAE.add_argparse_args(p)
+    p = SampleGenVAE.add_argparse_args(p)
     p = pl.Trainer.add_argparse_args(p)
     args = p.parse_args()
 
-    model = ShuffleGenVAE(args)
-    dm = JustImagesDataModule(
-        args.img_path, args.img_size,
+    model = SampleGenVAE(args)
+    dm = SampleImagesDataModule(
+        args.img_path, args.piece_size,
         batch_size=args.batch_size, num_workers=args.num_workers
     )
     trainer = pl.Trainer.from_argparse_args(args)

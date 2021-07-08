@@ -4,7 +4,7 @@ try:
     from shufflegen.trainers.utils import set_device_from_args
 except ImportError:
     pass
-    
+
 
 class App:
     app_name = 'base app'
@@ -12,13 +12,20 @@ class App:
     def __init__(self, args):
         self.args = args
 
+    def start(self):
+        self.setup()
+        self.run()
+
+    def setup(self):
+        pass
+
     def run(self):
         pass
 
     @classmethod
     def run_from_cli(cls):
         app = cls.create_from_cli()
-        app.run()
+        app.start()
 
     @classmethod
     def create_from_cli(cls):
@@ -37,7 +44,7 @@ class App:
     @classmethod
     def add_args_to_parser(cls, p):
         pass
-
+    
 
 class AppWithDevice(App):
     """Saves you the trouble of updating args with the desired device."""
